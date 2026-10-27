@@ -45,6 +45,7 @@ from .graphql_queries import (
 )
 
 FILE_URI_PREFIX = "file://"
+APP_TOKEN_REFRESH_MARGIN = 10 * 60  # seconds
 logger = logging.getLogger(__name__)
 
 
@@ -194,6 +195,21 @@ def parse_args(args=None):
         action="store_true",
         dest="as_app",
         help="authenticate as github app instead of as a user.",
+    )
+    parser.add_argument(
+        "--app-id",
+        dest="app_id",
+        help="github app id or client id; creates and refreshes installation tokens (implies --as-app)",
+    )
+    parser.add_argument(
+        "--app-private-key",
+        dest="app_private_key",
+        help="path to the github app private key (.pem), optionally as file://...",
+    )
+    parser.add_argument(
+        "--app-installation-id",
+        dest="app_installation_id",
+        help="id of the github app installation to back up",
     )
     parser.add_argument(
         "-o",
@@ -522,11 +538,34 @@ def parse_args(args=None):
         default=5,
         help="maximum number of retries for API calls (default: 5)",
     )
-    return parser.parse_args(args)
+    args = parser.parse_args(args)
+
+    app_args = (args.app_id, args.app_private_key, args.app_installation_id)
+    if any(app_args):
+        if not all(app_args):
+            parser.error(
+                "--app-id, --app-private-key and --app-installation-id must be used together"
+            )
+        if (
+            args.token_classic
+            or args.token_fine
+            or args.token_from_gh
+            or args.osx_keychain_item_name
+            or args.osx_keychain_item_account
+        ):
+            parser.error(
+                "--app-id cannot be combined with -t, -f, --token-from-gh or keychain options"
+            )
+        args.as_app = True
+
+    return args
 
 
 def get_auth(args, encode=True, for_git_cli=False):
     auth = None
+
+    if args.app_id:
+        args.token_classic = get_app_installation_token(args)
 
     if args.osx_keychain_item_name:
         if not args.osx_keychain_item_account:
@@ -676,6 +715,85 @@ def read_token_from_gh_cli(args):
     return token
 
 
+def build_app_jwt(private_key_path, claims):
+    """Build an RS256 JWT for authenticating as a GitHub App.
+
+    Signs with the openssl CLI so the project keeps no runtime dependencies.
+    """
+
+    def b64url(data):
+        return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+    header = b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("ascii"))
+    signing_input = header + b"." + b64url(json.dumps(claims).encode("ascii"))
+
+    try:
+        signature = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", private_key_path],
+            input=signing_input,
+            capture_output=True,
+            check=True,
+        ).stdout
+    except FileNotFoundError:
+        raise Exception("Unable to sign GitHub App JWT: 'openssl' executable not found")
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace").strip()
+        raise Exception("Unable to sign GitHub App JWT: {0}".format(stderr))
+
+    return (signing_input + b"." + b64url(signature)).decode("ascii")
+
+
+def get_app_installation_token(args):
+    """Return a GitHub App installation token, creating a new one when needed.
+
+    Installation tokens expire after an hour, so a new one is created once the
+    cached token is within APP_TOKEN_REFRESH_MARGIN seconds of expiring.
+    """
+    cached_token = getattr(args, "_app_token_value", None)
+    if cached_token and time.time() < (
+        args._app_token_expires_at - APP_TOKEN_REFRESH_MARGIN
+    ):
+        return cached_token
+
+    # GitHub rejects an exp more than 10 minutes out; backdate iat to tolerate
+    # clock drift.
+    now = int(time.time())
+    app_jwt = build_app_jwt(
+        args.app_private_key.removeprefix(FILE_URI_PREFIX),
+        {"iat": now - 60, "exp": now + 540, "iss": args.app_id},
+    )
+    request = Request(
+        "https://{0}/app/installations/{1}/access_tokens".format(
+            get_github_api_host(args), args.app_installation_id
+        ),
+        data=b"",
+        method="POST",
+    )
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("Authorization", "Bearer " + app_jwt)
+
+    try:
+        http_response = make_request_with_retry(request, app_jwt, args.max_retries)
+    except HTTPError as exc:
+        raise Exception(
+            "Unable to create GitHub App installation token: HTTP {0} {1}: {2}".format(
+                exc.code, exc.reason, exc.read().decode("utf-8", errors="replace")
+            )
+        )
+    response = json.loads(http_response.read().decode("utf-8"))
+
+    args._app_token_value = response["token"]
+    args._app_token_expires_at = calendar.timegm(
+        time.strptime(response["expires_at"], "%Y-%m-%dT%H:%M:%SZ")
+    )
+    logger.info(
+        "Created GitHub App installation token (expires {0})".format(
+            response["expires_at"]
+        )
+    )
+    return args._app_token_value
+
+
 def get_github_repo_url(args, repository):
     if repository.get("is_gist"):
         if args.prefer_ssh:
@@ -734,7 +852,6 @@ def retrieve_data(args, template, query_args=None, paginated=True, lazy=False):
     Handles throttling, retries, read errors, and DMCA takedowns.
     """
     query_args = query_args or {}
-    auth = get_auth(args, encode=not args.as_app)
     per_page = 100
 
     def _extract_next_page_url(link_header):
@@ -758,6 +875,8 @@ def retrieve_data(args, template, query_args=None, paginated=True, lazy=False):
             # FIRST: Fetch response
 
             for attempt in range(args.max_retries + 1):
+                # Resolved per request so long runs pick up refreshed app tokens
+                auth = get_auth(args, encode=not args.as_app)
                 request = _construct_request(
                     per_page=per_page if paginated else None,
                     query_args=query_args,
@@ -2201,7 +2320,8 @@ def backup_repositories(args, output_directory, repositories):
             if repository["has_wiki"] and download_wiki:
                 fetch_repository(
                     repository["name"],
-                    repo_url.replace(".git", ".wiki.git"),
+                    # Rebuilt so a long repository clone can't leave it an expired app token
+                    get_github_repo_url(args, repository).replace(".git", ".wiki.git"),
                     os.path.join(repo_cwd, "wiki"),
                     skip_existing=args.skip_existing,
                     bare_clone=args.bare_clone,
